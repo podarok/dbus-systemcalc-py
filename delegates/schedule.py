@@ -123,7 +123,10 @@ class ScheduledCharging(SystemCalcDelegate, ChargeControl):
 
 	def get_input(self):
 		return [
-			(HUB4_SERVICE, ['/Overrides/ForceCharge', '/Overrides/MaxDischargePower'])
+			(HUB4_SERVICE, [
+				'/Overrides/ForceCharge',
+				'/Overrides/MaxDischargePower',
+				'/Overrides/Setpoint'])
 		]
 
 	def settings_changed(self, setting, oldvalue, newvalue):
@@ -187,6 +190,14 @@ class ScheduledCharging(SystemCalcDelegate, ChargeControl):
 	@maxdischargepower.setter
 	def maxdischargepower(self, v):
 		return self._dbusmonitor.set_value_async(HUB4_SERVICE, '/Overrides/MaxDischargePower', v)
+
+	@property
+	def setpoint(self):
+		return self._dbusmonitor.get_value(HUB4_SERVICE, '/Overrides/Setpoint')
+
+	@setpoint.setter
+	def setpoint(self, v):
+		return self._dbusmonitor.set_value_async(HUB4_SERVICE, '/Overrides/Setpoint', v)
 
 	def _on_timer(self):
 		if self.soc is None:
@@ -260,6 +271,13 @@ class ScheduledCharging(SystemCalcDelegate, ChargeControl):
 				else:
 					scale = 0.8 + min(delta, 1)*0.15
 					self.maxdischargepower = max(1, round(self.pvpower*scale))
+					# Set a large negative setpoint so excess PV goes to
+					# grid. The maxdischargepower limit will ensure that only
+					# the available PV is actually converted to AC.
+					if Dvcc.instance.feedback_allowed:
+						self.setpoint = -32000
+					else:
+						self.setpoint = None # No override, normal ESS
 				break
 		else:
 			self.forcecharge = False
