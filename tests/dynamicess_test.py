@@ -21,6 +21,8 @@ DynamicEss._get_time = lambda *a: timer_manager.datetime
 class TestDynamicEss(TestSystemCalcBase):
 	vebus = 'com.victronenergy.vebus.ttyO1'
 	settings_service = 'com.victronenergy.settings'
+	rs_service = 'com.victronenergy.acsystem'
+	
 	def __init__(self, methodName='runTest'):
 		TestSystemCalcBase.__init__(self, methodName)
 
@@ -72,6 +74,230 @@ class TestDynamicEss(TestSystemCalcBase):
 	def tearDown(self):
 		DynamicEss.instance.release_control()
 
+	def test_0_RS_SetPointCalculations_Charge(self):
+		# SetPoint Calculation for the RS. 
+		# Just manual testing of the charge and discharge method. 
+		from delegates.dynamicess import MultiRsDevice
+
+		self._remove_device(self.vebus)
+		self._add_device(self.rs_service, product_name='Multi RS',
+			values={
+				'/State': 3,
+				'/DeviceInstance': 30,
+				'/Ess/AcPowerSetpoint': 0,
+				})
+	
+		self._add_device('com.victronenergy.pvinverter.mock33', {
+			'/Ac/L1/Power': 0,
+			'/Ac/L2/Power': 0,
+			'/Ac/L3/Power': 0,
+			'/Position': 0,
+			'/Connected': 1,
+			'/DeviceInstance': 33,
+		}) 
+
+		self._update_values()
+
+		mock = MultiRsDevice(
+			DynamicEss.instance,
+			DynamicEss.instance._dbusmonitor,
+			self.rs_service
+		)
+
+		self._set_setting('/Settings/DynamicEss/GridExportLimit', 10)
+		self._set_setting('/Settings/DynamicEss/GridImportLimit', 10)
+		self._set_setting('/Settings/DynamicEss/BatteryChargeLimit', 10)
+		self._set_setting('/Settings/DynamicEss/BatteryDischargeLimit', 10)
+
+		#Simple test-cases: No AC, DC or consumption, no restrictions. 
+		#Calculated Grid Setpoint should equal desired Battery charge plus efficiency offset. 
+		mock.charge(0,0,2500,True)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 2500 / 0.95)
+
+		#grid2bat restriction -> Setpoint should be 0.
+		mock.charge(0,2,2500,True)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 0)
+
+		#tests with 500 consumption
+		#500 consumption -> Setpoint should be 2500/0.95 + consumption
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 500.0)
+		self._update_values()
+		mock.charge(0,0,2500,True)
+		self.assertEqual(mock.consumption, 500)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 2500 / 0.95 + 500)
+
+		#add 500 AC-Solar. SetPoint should now be the same as in no solar/consumption case, it compensates the consumption. 
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 500.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 0)
+		self._update_values()
+		mock.charge(0,0,2500,True)
+		self.assertEqual(mock.consumption, 500)
+		self.assertEqual(mock.acpv, 500)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 2500 / 0.95)
+
+		#1000 solar now. That means, we can take 500 ACPV to charge. 
+		#500 ACPV will turn into 500*0.95 battery charge rate.
+		#so, requested grid setpoint to charge 2500W should be (2500 - 500 * 0.95) / 0.95 = 2.131,57...
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 1000.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', -500)
+		self._update_values()
+		mock.charge(0,0,2500,True)
+		self.assertEqual(mock.consumption, 500)
+		self.assertEqual(mock.acpv, 1000)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , (2500 - 500 * 0.95) / 0.95)
+		
+		#some limits to be tested.
+		#battery rate should be limited to 6000, GSP be 6000/0.95 again.
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 0.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 0)
+		self._set_setting('/Settings/DynamicEss/GridExportLimit', 30)
+		self._set_setting('/Settings/DynamicEss/GridImportLimit', 30)
+		self._set_setting('/Settings/DynamicEss/BatteryChargeLimit', 6)
+		self._set_setting('/Settings/DynamicEss/BatteryDischargeLimit', 30)
+		self._update_values()
+		mock.charge(0,0,9999,True)
+		self.assertEqual(mock.consumption, 0)
+		self.assertEqual(mock.acpv, 0)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 6000 / 0.95)
+		
+		#Grid limit, GSP should precicesly be 6000, battery rate come down to 6000*0,95
+		#but that is not calculated. It then is what it is. 
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 0.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 0)
+		self._set_setting('/Settings/DynamicEss/GridExportLimit', 30)
+		self._set_setting('/Settings/DynamicEss/GridImportLimit', 6)
+		self._set_setting('/Settings/DynamicEss/BatteryChargeLimit', 30)
+		self._set_setting('/Settings/DynamicEss/BatteryDischargeLimit', 30)
+		self._update_values()
+		mock.charge(0,0,9999,True)
+		self.assertEqual(mock.consumption, 0)
+		self.assertEqual(mock.acpv, 0)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 6000)
+		
+		#final test: Charge at a rate lower than ACPV. This should result in Feedin. 
+		#precicesly, we grab 4000 / 0,95 AC PV, so, setpoint should be (8000 - 4000/0.95) *-1
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 8000.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', -8000)
+		self._update_values()
+		mock.charge(0,0,4000,True)
+		self.assertEqual(mock.consumption, 0)
+		self.assertEqual(mock.acpv, 8000)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , (8000 - 4000/0.95) * -1)
+
+		#... and 0, if we don't allow Feedin ;) 
+		mock.charge(0,0,4000,False)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 0)
+
+	def test_0_RS_SetPointCalculations_Discharge(self):
+		from delegates.dynamicess import MultiRsDevice
+
+		self._remove_device(self.vebus)
+		self._add_device(self.rs_service, product_name='Multi RS',
+			values={
+				'/State': 3,
+				'/DeviceInstance': 30,
+				'/Ess/AcPowerSetpoint': 0,
+				})
+	
+		self._add_device('com.victronenergy.pvinverter.mock33', {
+			'/Ac/L1/Power': 0,
+			'/Ac/L2/Power': 0,
+			'/Ac/L3/Power': 0,
+			'/Position': 0,
+			'/Connected': 1,
+			'/DeviceInstance': 33,
+		})  
+
+		self._update_values()
+
+		mock = MultiRsDevice(
+			DynamicEss.instance,
+			DynamicEss.instance._dbusmonitor,
+			self.rs_service
+		)
+
+		self._set_setting('/Settings/DynamicEss/GridExportLimit', 10)
+		self._set_setting('/Settings/DynamicEss/GridImportLimit', 10)
+		self._set_setting('/Settings/DynamicEss/BatteryChargeLimit', 10)
+		self._set_setting('/Settings/DynamicEss/BatteryDischargeLimit', 10)
+
+		#Simple test-cases: No AC, DC or consumption, no restrictions. 
+		#Discharging 2500 means, we need to set a slightly lower GSP: 2500 * 0,95
+		mock.discharge(0,0,2500,True)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 2500 * -0.95)
+
+		#bat2grid restriction -> Setpoint should be 0.
+		mock.discharge(0,1,2500,True)
+		self.assertEqual(mock.consumption, 0)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 0)
+
+		#tests with 500 consumption
+		#Feedin should be 2500 * 0.95 - 500
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 500.0)
+		self._update_values()
+		mock.discharge(0,0,2500,True)
+		self.assertEqual(mock.consumption, 500)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , (2500 * 0.95 - 500) * -1) 
+
+		#add 500 AC-Solar. SetPoint should now be the same as in no solar/consumption case, it compensates the consumption. 
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 500.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 0)
+		self._update_values()
+		mock.discharge(0,0,2500,True)
+		self.assertEqual(mock.consumption, 500)
+		self.assertEqual(mock.acpv, 500)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , (2500 * 0.95) * -1)
+
+		#1000 solar now. That means, from the 500 ACPV we need to feedin 500 remaining watts as well.  
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 1000.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', -500)
+		self._update_values()
+		mock.discharge(0,0,2500,True)
+		self.assertEqual(mock.consumption, 500)
+		self.assertEqual(mock.acpv, 1000)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 2500 * -0.95 - 500)
+
+		#some limits to be tested.
+		#battery rate should be limited to 6000, GSP be 6000*0.95 again.
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 0.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 0)
+		self._set_setting('/Settings/DynamicEss/GridExportLimit', 30)
+		self._set_setting('/Settings/DynamicEss/GridImportLimit', 30)
+		self._set_setting('/Settings/DynamicEss/BatteryChargeLimit', 30)
+		self._set_setting('/Settings/DynamicEss/BatteryDischargeLimit', 6)
+		self._update_values()
+		mock.discharge(0,0,9999,True)
+		self.assertEqual(mock.consumption, 0)
+		self.assertEqual(mock.acpv, 0)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 6000 * -0.95)
+
+		#final test: discharge above grid limit 
+		#GSP should be precicesly -6000
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 0.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 0)
+		self._set_setting('/Settings/DynamicEss/GridExportLimit', 6)
+		self._set_setting('/Settings/DynamicEss/GridImportLimit', 30)
+		self._set_setting('/Settings/DynamicEss/BatteryChargeLimit', 30)
+		self._set_setting('/Settings/DynamicEss/BatteryDischargeLimit', 30)
+		self._update_values()
+		mock.discharge(0,0,9000,True)
+		self.assertEqual(mock.consumption, 0)
+		self.assertEqual(mock.acpv, 0)
+		self.assertEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , 6000 * -1)
+
+		#final test. With a bat2grid restriction, we can only feedin solar, when available. 
+		#So, when we have 500 consumption backed by 500 acpv, we can turn that into 
+		#backing 500 consumption by battery and feedin 500 acsolar.
+		self._monitor.set_value("com.victronenergy.pvinverter.mock33", '/Ac/L1/Power', 500.0)
+		self._monitor.set_value("com.victronenergy.grid.ttyUSB0", '/Ac/L1/Power', 0)
+		self._update_values()
+		mock.discharge(0,1,2000,True)
+		self.assertEqual(mock.consumption, 500)
+		self.assertEqual(mock.acpv, 500)
+		self.assertAlmostEqual(self._monitor.get_value(self.rs_service,'/Ess/AcPowerSetpoint') , -500, 4)
+
+		#debug only
+		self.assertEqual(True, False)
 	def test_1_SCHEDULED_SELFCONSUME(self):
 		
 		now = timer_manager.datetime
