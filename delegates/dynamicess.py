@@ -22,11 +22,11 @@ MAX_FEEDIN_VALUE = 96000
 TRANSITION_STATE_THRESHOLD = 90.0
 
 MODES = {
-       0: 'Off',
-       1: 'Auto',
-       2: 'Buy',
-       3: 'Sell',
-       4: 'Local'
+	0: 'Off',
+	1: 'Auto',
+	2: 'Buy',
+	3: 'Sell',
+	4: 'Local'
 }
 
 ERRORS = {
@@ -278,13 +278,11 @@ class VebusDevice(EssDevice):
 
 	@property
 	def hub4mode(self):
-		return self.monitor.get_value('com.victronenergy.settings',
-                '/Settings/CGwacs/Hub4Mode')
+		return self.monitor.get_value('com.victronenergy.settings', '/Settings/CGwacs/Hub4Mode')
 
 	@property
 	def maxfeedinpower(self):
-		local_feedin_limit = self.monitor.get_value('com.victronenergy.settings',
-                '/Settings/CGwacs/MaxFeedInPower')
+		local_feedin_limit = self.monitor.get_value('com.victronenergy.settings', '/Settings/CGwacs/MaxFeedInPower')
 
 		dess_feedin_limit = self.delegate.grid_export_limit * 1000.0 if self.delegate.grid_export_limit is not None else -1
 
@@ -459,6 +457,23 @@ class VebusDevice(EssDevice):
 		self._set_charge_power(None)
 
 class MultiRsDevice(EssDevice):
+	def __init__(self, delegate, monitor, service):
+		super().__init__(delegate, monitor, service)
+
+		try:
+			disable_charge = self.monitor.get_value(self.service, '/Ess/DisableDischarge')
+
+			if disable_charge is not None:
+				#Value is available, RS supports improved idling.
+				self.use_legacy_idle:bool = False
+			else:
+				raise Exception("Improved idling not available in ACSystem.")
+			
+		except Exception as ex:
+			#Handle as exception, in case dbusmonitor synchronous read throws an exception for non-existing paths.
+			logger.info("Configuring MultiRSDevice for legacy idling.")
+			self.use_legacy_idle:bool = True
+
 	@property
 	def available(self):
 		return self.monitor.get_value(self.service, '/Capabilities/HasDynamicEssSupport') == 1
@@ -482,6 +497,10 @@ class MultiRsDevice(EssDevice):
 
 	def charge(self, flags, restrictions, rate, allow_feedin):
 		self.monitor.set_value_async(self.service, '/Ess/DisableFeedIn', int(not allow_feedin) if allow_feedin is not None else 0)
+
+		if not self.use_legacy_idle:
+			self.monitor.set_value_async(self.service, '/Ess/DisableDischarge', 0)
+			self.monitor.set_value_async(self.service, '/Ess/DisableCharge', 0)
 
 		#if the desired rate is lower than dcpv, this would come down to NOT charging from AC,
 		#but 100% of dcpv. To really achieve an overall charge-rate of what's requested, we need
@@ -521,6 +540,11 @@ class MultiRsDevice(EssDevice):
 		batteryexport = not (restrictions & int(Restrictions.BAT2GRID))
 
 		self.monitor.set_value_async(self.service, '/Ess/DisableFeedIn', int(not allow_feedin) if allow_feedin is not None else 0)
+
+		if not self.use_legacy_idle:
+			self.monitor.set_value_async(self.service, '/Ess/DisableDischarge', 0)
+			self.monitor.set_value_async(self.service, '/Ess/DisableCharge', 0)
+
 		if allow_feedin:
 			# Calculate how fast to sell. If exporting the battery to the grid
 			# is allowed, then export rate plus whatever DC-coupled PV is
@@ -551,15 +575,29 @@ class MultiRsDevice(EssDevice):
 
 	def idle(self, allow_feedin):
 		self.monitor.set_value_async(self.service, '/Ess/DisableFeedIn', int(not allow_feedin) if allow_feedin is not None else 0)
-		self.monitor.set_value_async(self.service, '/Ess/UseInverterPowerSetpoint', 1)
-		self.monitor.set_value_async(self.service, '/Ess/InverterPowerSetpoint', -max(0, self.pvpower))
+
+		if self.use_legacy_idle:
+			self.monitor.set_value_async(self.service, '/Ess/UseInverterPowerSetpoint', 1)
+			self.monitor.set_value_async(self.service, '/Ess/InverterPowerSetpoint', -max(0, self.pvpower))
+		else:
+			self.monitor.set_value_async(self.service, '/Ess/UseInverterPowerSetpoint', 0)
+			self.monitor.set_value_async(self.service, '/Ess/DisableDischarge', 1)
+			self.monitor.set_value_async(self.service, '/Ess/DisableCharge', 1)
 
 	def self_consume(self, restrictions, allow_feedin):
+		if not self.use_legacy_idle:
+			self.monitor.set_value_async(self.service, '/Ess/DisableDischarge', 0)
+			self.monitor.set_value_async(self.service, '/Ess/DisableCharge', 0)
+
 		self.monitor.set_value_async(self.service, '/Ess/DisableFeedIn', int(not allow_feedin) if allow_feedin is not None else 0)
 		self.monitor.set_value_async(self.service, '/Ess/AcPowerSetpoint', 0)
 		self.monitor.set_value_async(self.service, '/Ess/UseInverterPowerSetpoint', 0)
 
 	def deactivate(self):
+		if not self.use_legacy_idle:
+			self.monitor.set_value_async(self.service, '/Ess/DisableDischarge', 0)
+			self.monitor.set_value_async(self.service, '/Ess/DisableCharge', 0)
+
 		self.monitor.set_value_async(self.service, '/Ess/DisableFeedIn', 0)
 		self.monitor.set_value_async(self.service, '/Ess/AcPowerSetpoint', 0)
 		self.monitor.set_value_async(self.service, '/Ess/UseInverterPowerSetpoint', 0)
@@ -805,17 +843,17 @@ class DynamicEss(SystemCalcDelegate, ChargeControl):
 	def grid_import_limit(self) -> float:
 		''' Grid import limit as configured by the user for DESS. In kW, positive, None if not set'''
 		return self._settings['dess_gridimportlimit'] if self._settings['dess_gridimportlimit'] >= 0 else None
-    
+
 	@property
 	def grid_export_limit(self)-> float:
 		''' Grid export limit as configured by the user for DESS. In kW, positive, None if not set'''
 		return self._settings['dess_gridexportlimit'] if self._settings['dess_gridexportlimit'] >= 0 else None
-    
+
 	@property
 	def battery_charge_limit(self)-> float:
 		''' Battery charge limit as configured by the user for DESS. In kW, positive, None if not set'''
 		return self._settings['dess_batterychargelimit'] if self._settings['dess_batterychargelimit'] >= 0 else None
-    
+
 	@property
 	def battery_discharge_limit(self)-> float:
 		''' Battery discharge limit as configured by the user for DESS. In kW, positive, None if not set'''
