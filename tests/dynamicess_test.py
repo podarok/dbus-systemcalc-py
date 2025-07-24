@@ -500,7 +500,7 @@ class TestDynamicEss(TestSystemCalcBase):
 			'/Ac/Consumption/L3/Power': 0,
 		})
 
-		self.validate_self_consume(None, 1.0) #1.0 should be the result, when no consumption present.
+		self.validate_self_consume(None, -1.0) #-1.0 should be the result, when no consumption present.
 
 	def test_21_IDLE_NO_DISCHARGE_OPPORTUNITY(self):
 		now = timer_manager.datetime
