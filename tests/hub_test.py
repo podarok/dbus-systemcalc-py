@@ -442,6 +442,30 @@ class TestHubSystem(TestSystemCalcBase):
 		self.assertAlmostEqual(c1.maxchargecurrent, 91.5)
 		self.assertAlmostEqual(c2.maxchargecurrent, 13.5)
 
+	def test_charge_current_distribution_low_limit_at_capacity(self):
+		# Three chargers all running flat out, but the requested max
+		# charge current is very low (2.8A). Each charger should end up
+		# with roughly a third of the requested current, and definitely
+		# no charger should exceed the requested max.
+		from delegates.dvcc import ChargerSubsystem
+
+		chargers = [
+			c1 := Charger(100, 100, 100), # 100A charger, unlimited, doing 100A
+			c2 := Charger(100, 100, 100), # 100A charger, unlimited, doing 100A
+			c3 := Charger(100, 100, 100) # 100A charger, unlimited, doing 100A
+		]
+
+		for _ in range(3):
+			ChargerSubsystem._distribute_current(chargers, 2.8)
+
+		# No charger may be assigned more than the requested maximum
+		for c in (c1, c2, c3):
+			self.assertLessEqual(c.maxchargecurrent, 2.8)
+
+		# The limits should add up to (roughly) the requested maximum
+		self.assertAlmostEqual(
+			sum(c.maxchargecurrent for c in (c1, c2, c3)), 2.8, places=1)
+
 	def test_control_vedirect_solarcharger_bms_ess_feedback(self):
 		# When feedback is allowed we do not limit MPPTs
 		# Force system type to ESS

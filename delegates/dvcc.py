@@ -740,8 +740,24 @@ class ChargerSubsystem(object):
 		try:
 			P = (max_charge_current - actual) / max(capacity - actual, 0.0)
 		except ZeroDivisionError:
-			# Already at capacity, leave it alone for now
-			return min(max_charge_current, capacity)
+			# The chargers are running flat out (actual == capacity), so
+			# the ratio is undefined. Fall back to splitting the requested
+			# current proportionally to each charger's capacity. This limits
+			# the chargers when max_charge_current is below what they are
+			# currently producing.
+			assigned = 0.0
+			spillover = 0.0
+			for charger in chargers:
+				l = max(max_charge_current * (
+					charger.currentlimit / capacity) + spillover, 0.0)
+
+				# The vreg is only capable of the nearest 100mA, so round
+				# it, and keep the remainder for the next iteration,
+				# so the max error is 100mA at the last charger.
+				spillover = l - (r := round(l, 1))
+				charger.maxchargecurrent = r
+				assigned += r
+			return min(max_charge_current, assigned)
 		else:
 			assigned = 0.0
 			spillover = 0.0
