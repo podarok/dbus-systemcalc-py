@@ -22,7 +22,7 @@ from logger import setup_logging
 import delegates
 from sc_utils import safeadd as _safeadd, safemax as _safemax
 
-softwareVersion = '2.252'
+softwareVersion = '2.257'
 
 # Pre-computed path strings for the hot path in _updatevalues().
 # Avoids repeated % string formatting every 1-second tick.
@@ -73,6 +73,7 @@ class SystemCalc:
 				'/Connected': dummy,
 				'/ProductName': dummy,
 				'/Mgmt/Connection': dummy,
+				'/Mgmt/InsecureConnection': dummy,
 				'/DeviceInstance': dummy,
 				'/Dc/0/Voltage': dummy,
 				'/Dc/1/Voltage': dummy,
@@ -86,7 +87,8 @@ class SystemCalc:
 				'/ConsumedAmphours': dummy,
 				'/ProductId': dummy,
 				'/CustomName': dummy,
-				'/Info/MaxChargeVoltage': dummy},
+				'/Info/MaxChargeVoltage': dummy,
+				'/Settings/DischargeFloor': dummy},
 			'com.victronenergy.vebus' : {
 				'/Ac/ActiveIn/ActiveInput': dummy,
 				'/Ac/ActiveIn/L1/P': dummy,
@@ -271,7 +273,8 @@ class SystemCalc:
 			delegates.LoadShedding(),
 			delegates.MotorDrive(),
 			delegates.MotorDriveConsumption(),
-			delegates.MotorDriveRange()]
+			delegates.MotorDriveRange(),
+			delegates.PvStartStopControl()]
 
 		for m in self._modules:
 			for service, paths in m.get_input():
@@ -746,9 +749,16 @@ class SystemCalc:
 
 			if batteryservicetype in ('battery', 'inverter', 'multi', 'acsystem'):
 				newvalues['/Dc/Battery/Voltage'] = self._dbusmonitor.get_value(self._batteryservice, '/Dc/0/Voltage')
-				newvalues['/Dc/Battery/VoltageService'] = self._batteryservice
 				newvalues['/Dc/Battery/Current'] = self._dbusmonitor.get_value(self._batteryservice, '/Dc/0/Current')
 				newvalues['/Dc/Battery/Power'] = self._dbusmonitor.get_value(self._batteryservice, '/Dc/0/Power')
+
+				# If the connection is not secure, eg by Bluetooth, don't use
+				# it for serious voltage sensing (this value is used for SVS
+				# elsewhere).
+				if self._dbusmonitor.get_value(self._batteryservice, '/Mgmt/InsecureConnection') == 1:
+					newvalues['/Dc/Battery/VoltageService'] = None
+				else:
+					newvalues['/Dc/Battery/VoltageService'] = self._batteryservice
 
 				if batteryservicetype == 'battery':
 					capacity = self._dbusmonitor.get_value(self._batteryservice, '/InstalledCapacity')

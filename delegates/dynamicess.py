@@ -3,7 +3,7 @@ from gi.repository import GLib # type: ignore
 from delegates.base import SystemCalcDelegate
 from delegates.batterysoc import BatterySoc
 from delegates.schedule import ScheduledWindow
-from delegates.dvcc import Dvcc
+from delegates.dvcc import Dvcc, PvStartStopControl
 from delegates.batterylife import BatteryLife
 from delegates.batterylife import State as BatteryLifeState
 from delegates.chargecontrol import ChargeControl
@@ -51,6 +51,7 @@ class OperatingMode(int, Enum):
 class Flags(IntFlag):
 	NONE = 0
 	FASTCHARGE = 1
+	DISABLEPV = 2
 
 class Restrictions(IntFlag):
 	NONE = 0
@@ -669,6 +670,7 @@ class DynamicEss(SystemCalcDelegate, ChargeControl):
 		self.iteration_change_tracker = IterationChangeTracker(self)
 		self._is_idle = False #Flag indicating if we are currently idling, resulting in a quick-update of the idle-setpoint upon value change.
 		self._idle_feedin = None #Cache the feedin-allowance of the window during idle, to quickly update the idle setpoint upon value changes.
+		self._is_pv_disabled = False #Flag indicating if PV is currently disabled.
 
 		#define the four kind of deterministic states we have.
 		#SCHEDULED_SELFCONSUME is left out, it isn't part of the overall deterministic strategy tree, but a quick escape before entering.
@@ -693,7 +695,9 @@ class DynamicEss(SystemCalcDelegate, ChargeControl):
 		#               8 = values set on Venus (Battery balancing, capacity, operation mode)
 		#              16 = DESS split coping capability
 		#              32 = support decimal target soc values
-		self._dbusservice.add_path('/DynamicEss/Capabilities', value=63)
+		#              64 = (reserved)
+		#             128 = Disable PV.
+		self._dbusservice.add_path('/DynamicEss/Capabilities', value=0b10111111)
 		self._dbusservice.add_path('/DynamicEss/NumberOfSchedules', value=NUM_SCHEDULES)
 		self._dbusservice.add_path('/DynamicEss/Active', value=0, gettextcallback=lambda p, v: MODES.get(v, 'Unknown'))
 		self._dbusservice.add_path('/DynamicEss/TargetSoc', value=0.0, gettextcallback=lambda p, v: '{}%'.format(v))
@@ -1101,6 +1105,9 @@ class DynamicEss(SystemCalcDelegate, ChargeControl):
 						next_window = w
 						break # out of for loop
 
+				# validate solar-system state
+				self._disable_pv(Flags.DISABLEPV in current_window.flags)
+
 				#As of now, one common handler is enough. Hence, we don't need to validate the operation mode
 				final_strategy = self._determine_reactive_strategy(current_window, next_window, current_window.restrictions, now)
 
@@ -1420,6 +1427,20 @@ class DynamicEss(SystemCalcDelegate, ChargeControl):
 
 			return reactive_strategy
 
+	def _disable_pv(self, disabled:bool):
+		'''
+			Checks, if pv should be enabled or disabled and ensures that state.
+		'''
+		# If pv shall be disabled, we need to recuringly set that path.
+		if disabled:
+			PvStartStopControl.instance.disable_pv(True)
+			self._is_pv_disabled = True
+		else:
+			# Only need to disable it once
+			if self._is_pv_disabled:
+				PvStartStopControl.instance.disable_pv(False)
+				self._is_pv_disabled = False
+
 	def deactivate(self, reason):
 		try:
 			self._device.deactivate()
@@ -1428,6 +1449,7 @@ class DynamicEss(SystemCalcDelegate, ChargeControl):
 		self.release_control()
 		self.active = 0 # Off
 		self.errorcode = reason
+		self._disable_pv(False) #enable pv, if it was disabled.
 		self.targetsoc = None
 		self._is_idle = False
 		self._dbusservice['/DynamicEss/ChargeRate'] = self.chargerate = None

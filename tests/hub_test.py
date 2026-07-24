@@ -442,6 +442,90 @@ class TestHubSystem(TestSystemCalcBase):
 		self.assertAlmostEqual(c1.maxchargecurrent, 91.5)
 		self.assertAlmostEqual(c2.maxchargecurrent, 13.5)
 
+	def test_charge_current_distribution_low_limit_at_capacity(self):
+		# Three chargers all running flat out, but the requested max
+		# charge current is very low (2.8A). Each charger should end up
+		# with roughly a third of the requested current, and definitely
+		# no charger should exceed the requested max.
+		from delegates.dvcc import ChargerSubsystem
+
+		chargers = [
+			c1 := Charger(100, 100, 100), # 100A charger, unlimited, doing 100A
+			c2 := Charger(100, 100, 100), # 100A charger, unlimited, doing 100A
+			c3 := Charger(100, 100, 100) # 100A charger, unlimited, doing 100A
+		]
+
+		for _ in range(3):
+			ChargerSubsystem._distribute_current(chargers, 2.8)
+
+		# No charger may be assigned more than the requested maximum
+		for c in (c1, c2, c3):
+			self.assertLessEqual(c.maxchargecurrent, 2.8)
+
+		# The limits should add up to (roughly) the requested maximum
+		self.assertAlmostEqual(
+			sum(c.maxchargecurrent for c in (c1, c2, c3)), 2.8, places=1)
+
+	def test_charge_current_distribution_yield_exceeds_limit(self):
+		# Inverter/chargers derive their smoothed current from PV yield
+		# (/Yield/Power), which also feeds AC loads or the grid and can
+		# therefore read higher than the charger's assigned limit. This
+		# must not blow up the distribution and hand out limits that far
+		# exceed the requested maximum.
+		from delegates.dvcc import ChargerSubsystem
+
+		chargers = [
+			# 100A capacity, currently limited to 20A, but PV yield reads
+			# 80A because the solar is feeding AC loads directly.
+			c1 := Charger(100, 20, 80),
+			c2 := Charger(100, 20, 80),
+			c3 := Charger(100, 20, 80)
+		]
+
+		for _ in range(3):
+			ChargerSubsystem._distribute_current(chargers, 30)
+
+		# No charger may be assigned more than the requested maximum
+		for c in (c1, c2, c3):
+			self.assertLessEqual(c.maxchargecurrent, 30)
+
+		# The load is shared evenly and adds up to the requested maximum
+		self.assertAlmostEqual(c1.maxchargecurrent, 10.0)
+		self.assertAlmostEqual(c2.maxchargecurrent, 10.0)
+		self.assertAlmostEqual(c3.maxchargecurrent, 10.0)
+		self.assertAlmostEqual(
+			sum(c.maxchargecurrent for c in (c1, c2, c3)), 30.0, places=1)
+
+	def test_charge_current_distribution_reduce_below_production(self):
+		# The battery asks for much less (28A) than the chargers are
+		# producing. Reducing must not push any charger's limit negative
+		# and then silently drop that reduction, which would make the
+		# remaining limits add up to more than the requested maximum.
+		from delegates.dvcc import ChargerSubsystem
+
+		chargers = [
+			# 90A capacity each. Two produce 70A, one produces 58A.
+			c1 := Charger(90, 90, 70),
+			c2 := Charger(90, 90, 70),
+			c3 := Charger(90, 90, 58)
+		]
+
+		for _ in range(3):
+			ChargerSubsystem._distribute_current(chargers, 28)
+
+		# No charger may be assigned more than the requested maximum, and
+		# the total must not exceed it either.
+		for c in (c1, c2, c3):
+			self.assertLessEqual(c.maxchargecurrent, 28)
+		self.assertLessEqual(
+			sum(c.maxchargecurrent for c in (c1, c2, c3)), 28.1)
+
+		# Reduction is shared proportionally to production and adds up to
+		# (roughly) the requested maximum.
+		self.assertAlmostEqual(c1.maxchargecurrent, 9.9, places=1)
+		self.assertAlmostEqual(c2.maxchargecurrent, 9.9, places=1)
+		self.assertAlmostEqual(c3.maxchargecurrent, 8.2, places=1)
+
 	def test_control_vedirect_solarcharger_bms_ess_feedback(self):
 		# When feedback is allowed we do not limit MPPTs
 		# Force system type to ESS
@@ -539,6 +623,107 @@ class TestHubSystem(TestSystemCalcBase):
 			'/Control/SolarChargeVoltage': 1,
 			'/Control/EffectiveChargeVoltage': 58.3,
 			'/Control/BmsParameters': 1})
+
+	def test_control_vedirect_solarcharger_bms_ess_feedback_genset(self):
+		# When feedback is allowed we do not limit MPPTs, but if the active AC
+		# input is a genset (AcInput == 2), feed-in is not possible, so the
+		# charge current limit should still be applied. This test verifies that
+		# the MPPT is limited in that case.
+		# Force system type to ESS
+		self._monitor.add_value('com.victronenergy.vebus.ttyO1', '/Hub4/AssistantId', 5)
+		self._monitor.add_value('com.victronenergy.vebus.ttyO1', '/Hub/ChargeVoltage', 58.3)
+		self._monitor.add_value('com.victronenergy.settings', '/Settings/CGwacs/OvervoltageFeedIn', 1)
+		# The active AC input is the second input, which is configured as a
+		# genset (AcInput2 == 2 in setUp). AC is still connected.
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/Ac/ActiveIn/ActiveInput', 1)
+		self._add_device('com.victronenergy.solarcharger.ttyO2', {
+			'/State': 1,
+			'/Settings/ChargeCurrentLimit': 100,
+			'/Link/NetworkMode': 0,
+			'/Link/ChargeVoltage': 57.3,
+			'/Link/ChargeCurrent': 20,
+			'/Link/VoltageSense': None,
+			'/Dc/0/Voltage': 12.6,
+			'/Dc/0/Current': 31,
+			'/FirmwareVersion': 0x0129},
+			connection='VE.Direct')
+		self._add_device('com.victronenergy.battery.ttyO2',
+			product_name='battery',
+			values={
+				'/Dc/0/Voltage': 58.0,
+				'/Dc/0/Current': 5.3,
+				'/Dc/0/Power': 65,
+				'/Soc': 15.3,
+				'/DeviceInstance': 2,
+				'/Info/BatteryLowVoltage': 47,
+				'/Info/MaxChargeCurrent': 45,
+				'/Info/MaxChargeVoltage': 58.2,
+				'/Info/MaxDischargeCurrent': 50})
+		self._update_values(interval=60000)
+		self._check_external_values({
+			'com.victronenergy.solarcharger.ttyO2': {
+				'/Link/NetworkMode': 13,
+				'/Link/ChargeCurrent': 45 + 8,
+				'/Link/ChargeVoltage': 58.3},
+			'com.victronenergy.vebus.ttyO1': {
+				'/BatteryOperationalLimits/BatteryLowVoltage': 47,
+				'/BatteryOperationalLimits/MaxChargeCurrent': 14,
+				'/BatteryOperationalLimits/MaxChargeVoltage': 58.2,
+				'/BatteryOperationalLimits/MaxDischargeCurrent': 50,
+				'/Dc/0/MaxChargeCurrent': 999}})
+		self._check_values({
+			'/SystemType': 'ESS',
+			'/Control/SolarChargeCurrent': 1,
+			'/Control/SolarChargeVoltage': 1,
+			'/Control/EffectiveChargeVoltage': 58.3,
+			'/Control/BmsParameters': 1})
+
+	def test_mppt_absorb_float_minimum_offset(self):
+		# When the battery is in absorb (4) or float (5) state and feedback is
+		# allowed, DVCC applies a minimum 0.1 V offset so that MPPTs that are
+		# calibrated slightly below the BMS limit keep charging, allowing
+		# feed-in to be reached faster.
+		#
+		# The Multi's firmware safeguard prevents it from raising hub_voltage
+		# while it is still charging (AC-coupled PV scenario), so the normal
+		# ovoffset calculation yields 0. The workaround forces it to 0.1.
+		#
+		# hub_voltage = 58.3, BMS max = 58.2, bol.chargevoltage = None (first tick)
+		# -> ovoffset = max(0.0, 0.1) = 0.1
+		# -> charge_voltage = min(58.3, 58.3) = 58.3  (vs 58.2 without workaround)
+		self._monitor.add_value('com.victronenergy.vebus.ttyO1', '/Hub4/AssistantId', 5)
+		self._monitor.add_value('com.victronenergy.vebus.ttyO1', '/Hub/ChargeVoltage', 58.2)
+		self._monitor.add_value('com.victronenergy.settings', '/Settings/CGwacs/OvervoltageFeedIn', 1)
+		self._monitor.set_value('com.victronenergy.vebus.ttyO1', '/State', 4)
+		self._add_device('com.victronenergy.solarcharger.ttyO1', {
+			'/State': 3,
+			'/Settings/ChargeCurrentLimit': 35,
+			'/Link/NetworkMode': 0,
+			'/Link/ChargeVoltage': None,
+			'/Link/ChargeCurrent': None,
+			'/Link/VoltageSense': None,
+			'/Dc/0/Voltage': 58.0,
+			'/Dc/0/Current': 15,
+			'/FirmwareVersion': 0x0129},
+			connection='VE.Direct')
+		self._add_device('com.victronenergy.battery.ttyO2',
+			product_name='battery',
+			values={
+				'/Dc/0/Voltage': 58.0,
+				'/Dc/0/Current': 2,
+				'/Dc/0/Power': 116,
+				'/Soc': 95,
+				'/DeviceInstance': 2,
+				'/Info/BatteryLowVoltage': 47,
+				'/Info/MaxChargeCurrent': 45,
+				'/Info/MaxChargeVoltage': 58.2,
+				'/Info/MaxDischargeCurrent': 50})
+		self._update_values(interval=10000)
+		self._check_external_values({
+			'com.victronenergy.solarcharger.ttyO1': {
+				'/Link/ChargeVoltage': 58.3}})
+		self._check_values({
+			'/Control/EffectiveChargeVoltage': 58.3})
 
 	def test_hub1_control_vedirect_solarcharger_bms_battery_no_solarcharger(self):
 		self._add_device('com.victronenergy.battery.ttyO2',
@@ -1174,6 +1359,7 @@ class TestHubSystem(TestSystemCalcBase):
 				'/Info/MaxChargeVoltage': 53.2,
 				'/Info/MaxDischargeCurrent': 25,
 				'/InstalledCapacity': None,
+				'/System/MinCellVoltage': 3.5,
 				'/System/MaxCellVoltage': 4.5,
 				'/ProductId': 0xB009})
 

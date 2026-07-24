@@ -1,3 +1,4 @@
+import dbus
 from dbus.exceptions import DBusException
 from gi.repository import GLib
 from math import pi, ceil
@@ -5,6 +6,7 @@ from itertools import count, chain
 from functools import partial
 
 # Victron packages
+from vedbus import VeDbusItemExport
 from sc_utils import safeadd, copy_dbus_value, ExpiringValue, reify
 from ve_utils import exit_on_error
 
@@ -102,15 +104,31 @@ class _pylontech_quirk(BatteryBehaviour):
 					return min(cv, 27.6)
 				return min(cv, 27.8)
 			else:
-				# 48V
-				# Aim for 52.5V, but somewhat aggressively penalise the charge
-				# voltage if the highest cell goes over 3.485V. Filter this
-				# to keep it somewhat stable.
+				# 48V, 15 cells
+				# Aim for max 52.8V. Start from the current voltage, and
+				# add an offset that assumes all cells move together, to get
+				# them to 3.525V each. Add a correction factor to account
+				# for skew, in case cell voltages are skewed low or high.
+				# Filter the entire thing to keep it stable.
 				try:
-					cv = max(47.0, 52.5 - 30 * max(0, bms.maxcellvoltage-3.485))
+					# distance between high and low cell
+					spread = max(0.0, bms.maxcellvoltage - bms.mincellvoltage)
+
+					# δ = average - median (estimated as cell_middle)
+					dd =  bms.voltage/15 - spread/2
+
+					# Skew, value between -0.5 and 0.5 indicating how much our
+					# cell voltages are leaning left or right
+					try:
+						skew = min(0.5, max(-0.5, dd / spread))
+					except ZeroDivisionError:
+						skew = 0.0
+
+					cv = max(47.0, min(52.8,
+						bms.voltage + 16 * (3.52-bms.maxcellvoltage) - skew * spread))
 					cv = self._chargevoltage = 0.95 * self._chargevoltage + 0.05 * cv
 					return round(cv, 2)
-				except TypeError:
+				except TypeError: # One of the factors was None
 					return min(cv, 52.4)
 
 		# Not known, probably a 12V battery.
@@ -614,7 +632,7 @@ class ChargerSubsystem(object):
 			charger.chargevoltage = bms_charge_voltage
 		return voltage_written
 
-	def set_maxchargecurrent(self, max_charge_current, feedback_allowed, stop_on_mcc0):
+	def set_maxchargecurrent(self, max_charge_current, feedback_allowed, stop_on_mcc0, pv_disabled=False):
 		""" Distribute max charge current to all chargers. """
 		# Do not limit max charge current when feedback is allowed. The
 		# rationale behind this is that MPPT charge power should match the
@@ -638,7 +656,7 @@ class ChargerSubsystem(object):
 		elif self.acsystem_allows_feedback: # By Multi-RS
 			# The maximum to generate, is what the battery can take, plus
 			# what the inverter/charger can take off our hands.
-			m = max_charge_current + self._acsystem0.discharge_capacity
+			m = (max_charge_current + self._acsystem0.discharge_capacity) if not pv_disabled else 0
 
 			# The total charge current, somewhat smoothed, that the external
 			# solar chargers are making.
@@ -654,7 +672,7 @@ class ChargerSubsystem(object):
 			# And when mm becomes negative, that is when we have overcurrent,
 			# feed that to the grid.
 			self._acsystem0.discharge_setpoint = max(0.0, round(-mm, 1))
-		elif feedback_allowed: # by VE.Bus Multi, max_charge_current is not None
+		elif feedback_allowed and not pv_disabled: # by VE.Bus Multi, max_charge_current is not None
 			# Maximise all chargers, as we have always done, and let the Multi
 			# feed it in using overvoltage-feedin.
 			for charger in chargers:
@@ -716,19 +734,65 @@ class ChargerSubsystem(object):
 		# are running flat out, and can be handled separately.
 
 		capacity = sum(c.currentlimit for c in chargers)
-		limit = sum(c.maxchargecurrent for c in chargers)
-		actual = min(sum(c.smoothed_current for c in chargers), limit)
+
+		# The charge current a charger contributes to the battery cannot
+		# exceed its own capacity. For inverter/chargers the smoothed current
+		# is derived from PV yield (/Yield/Power), which also feeds AC loads
+		# or the grid and can therefore read higher than the charger's DC
+		# current limit. Clamp it per charger so the interpolation below stays
+		# well-defined (a <= c) and the individual currents remain consistent
+		# with their total (otherwise the distributive law used to compute the
+		# limits breaks and hands out limits that exceed max_charge_current).
+		currents = [min(c.smoothed_current, c.currentlimit) for c in chargers]
+		actual = sum(currents)
+
+		if max_charge_current < actual:
+			# We need less than the chargers are currently producing. The
+			# interpolation below (between production and capacity) would
+			# extrapolate the limit of a charger with a lot of headroom
+			# below zero; clamping that to zero silently drops the reduction
+			# and makes the remaining limits add up to more than requested.
+			# Instead scale each charger's production down proportionally,
+			# which keeps every limit in [0, actual] and sums to the target.
+			assigned = 0.0
+			spillover = 0.0
+			for charger, a in zip(chargers, currents):
+				l = max(a * (max_charge_current / actual) + spillover, 0.0)
+
+				# The vreg is only capable of the nearest 100mA, so round
+				# it, and keep the remainder for the next iteration,
+				# so the max error is 100mA at the last charger.
+				spillover = l - (r := round(l, 1))
+				charger.maxchargecurrent = r
+				assigned += r
+			return min(max_charge_current, assigned)
 
 		try:
 			P = (max_charge_current - actual) / max(capacity - actual, 0.0)
 		except ZeroDivisionError:
-			# Already at capacity, leave it alone for now
-			return min(max_charge_current, capacity)
-		else:
+			# The chargers are running flat out (actual == capacity), so
+			# the ratio is undefined. Fall back to splitting the requested
+			# current proportionally to each charger's capacity. This limits
+			# the chargers when max_charge_current is below what they are
+			# currently producing.
 			assigned = 0.0
 			spillover = 0.0
 			for charger in chargers:
-				l = max((a := charger.smoothed_current) + P * (
+				l = max(max_charge_current * (
+					charger.currentlimit / capacity) + spillover, 0.0)
+
+				# The vreg is only capable of the nearest 100mA, so round
+				# it, and keep the remainder for the next iteration,
+				# so the max error is 100mA at the last charger.
+				spillover = l - (r := round(l, 1))
+				charger.maxchargecurrent = r
+				assigned += r
+			return min(max_charge_current, assigned)
+		else:
+			assigned = 0.0
+			spillover = 0.0
+			for charger, a in zip(chargers, currents):
+				l = max(a + P * (
 					charger.currentlimit - a) + spillover, 0.0)
 
 				# The vreg is only capable of the nearest 100mA, so round
@@ -807,6 +871,10 @@ class Multi(object):
 	@property
 	def has_ess_assistant(self):
 		return getattr(MultiService.instance.vebus_service, 'has_ess_assistant', False)
+
+	@property
+	def active_source_type(self):
+		return getattr(MultiService.instance.vebus_service, 'active_source_type', None)
 
 	@property
 	def dc_current(self):
@@ -1262,9 +1330,13 @@ class Dvcc(SystemCalcDelegate):
 			voltage_written = self._set_solarcharger_voltage(
 				bms_charge_voltage, effective_charge_voltage, vecan_voltage)
 
+			# check if pv is disabled.
+			pv_disabled = PvStartStopControl.instance.pv_disabled
+			_max_charge_current = 0 if pv_disabled else _max_charge_current
+
 			# Set current limits
 			# Try to push the solar chargers to the vebus-compensated value
-			self._chargesystem.set_maxchargecurrent(_max_charge_current, self.feedback_allowed, stop_on_mcc0)
+			self._chargesystem.set_maxchargecurrent(_max_charge_current, self.feedback_allowed, stop_on_mcc0, pv_disabled)
 			current_written = int(network_mode_written and _max_charge_current is not None)
 
 		update_solarcharger_control_flags(voltage_written, current_written, effective_charge_voltage)
@@ -1401,7 +1473,10 @@ class Dvcc(SystemCalcDelegate):
 	def feedback_allowed(self):
 		# Feedback allowed is defined as 'ESS present and FeedInOvervoltage is
 		# enabled'. This ignores other setups which allow feedback: hub-1.
+		# Feed-in is not possible when the active AC input is a genset
+		# (AcInput == 2), so feedback is not allowed in that case either.
 		return self.has_ess_assistant and self._multi.ac_connected and \
+			self._multi.active_source_type != 2 and \
 			self._dbusmonitor.get_value('com.victronenergy.settings',
 				'/Settings/CGwacs/OvervoltageFeedIn') == 1
 
@@ -1417,10 +1492,11 @@ class Dvcc(SystemCalcDelegate):
 		# BMS (if any). This will probably prevent feedback, but that is
 		# probably not allowed anyway.
 		charge_voltage = vecan_voltage = None
-		if self._multi.active:
+		if self._multi.active and self._multi.hub_voltage is not None:
 			# Calculate the offset that is currently being applied for
 			# overvoltage feedin.
 			ovoffset = 0.0
+			abs_offset = 0.0
 			try:
 				ovoffset = max(0.0, min(
 					self._multi.hub_voltage - self._multi.bol.chargevoltage,
@@ -1428,15 +1504,29 @@ class Dvcc(SystemCalcDelegate):
 			except TypeError:
 				pass
 
+			# This is a workaround for cases where the Multi does not
+			# increase the charge voltage (yet), because there is AC-coupled
+			# capacity and the battery still accepts plenty of current
+			# from the Multis. In some cases, the MPPTs may be calibrated
+			# slightly lower, and they will stop charging. By adding a small
+			# offset of our own, when the battery is in absorb or float state,
+			# and feedback is allowed, we keep the MPPT charging so that
+			# feed-in can be reached faster. By limiting this to charge
+			# states, we are not adding anything if the Multi is not in a
+			# charging state, eg Inverting.
+			if self._multi.state in (3, 4, 5) and self.feedback_allowed:
+				ovoffset = max(ovoffset, 0.1)
+				abs_offset = 0.1
+
 			# Allow the hub_voltage to be max 0.4V higher than the
 			# bms_charge_voltage. This helps to deal with delays in
 			# the pipeline, otherwise it takes a full extra 3 seconds for
 			# a lowered CVL to work its way through the ESS pipeline.
 			try:
 				charge_voltage = vecan_voltage = min(
-					bms_charge_voltage + ovoffset, self._multi.hub_voltage)
+					bms_charge_voltage + ovoffset, self._multi.hub_voltage + abs_offset)
 			except TypeError:
-				charge_voltage = vecan_voltage = self._multi.hub_voltage
+				charge_voltage = vecan_voltage = self._multi.hub_voltage + abs_offset
 
 		# Next try a voltage from an inverter/charger
 		if charge_voltage is None:
@@ -1576,3 +1666,82 @@ class Dvcc(SystemCalcDelegate):
 					pass
 
 		return (voltage_written, current_written)
+
+class DisablePvItem(VeDbusItemExport):
+	@dbus.service.method('com.victronenergy.BusItem', in_signature='v', out_signature='i')
+	def SetValue(self, newvalue):
+		try:
+			newvalue = int(newvalue)
+		except (ValueError, TypeError):
+			return 1
+		self._onchangecallback(self.__dbus_object_path__, newvalue)
+		self.local_set_value(newvalue)
+		return 0
+
+class PvStartStopControl(SystemCalcDelegate):
+	def __init__(self):
+		super(PvStartStopControl, self).__init__()
+		self._pv_disabled = ExpiringValue(20, False)
+		self._acsystem0 = None
+
+	def set_sources(self, dbusmonitor, settings, dbusservice):
+		super(PvStartStopControl, self).set_sources(dbusmonitor, settings, dbusservice)
+
+		self._dbusservice.add_path('/Pv/Disable', value=0, writeable=True,
+			itemtype=DisablePvItem,
+			onchangecallback=lambda p, v: self.disable_pv(v))
+
+	def get_input(self):
+		return [
+			('com.victronenergy.hub4', ['/Pv/Disable']),
+			('com.victronenergy.acsystem', ['/Pv/Disable']),
+			('com.victronenergy.shelly',  ['/Pv/Disable'])
+		]
+
+	def disable_pv(self, v:bool):
+		disabled:bool = int(v) > 0
+		self._dbusservice["/Pv/Disable"] = int(disabled)
+
+		# Tell hub4 (for acpv), DVCC (solar chargers) and acsystem (MultiRS)
+		# about the desired PV shutdown.  DVCC will read the pv_disabled
+		# property. dbus-shelly can provide shelly based inverters it can turn
+		# off.
+		self.pv_disabled = disabled
+		self._dbusmonitor.set_value_async("com.victronenergy.hub4", "/Pv/Disable", int(disabled))
+		self._dbusmonitor.set_value_async("com.victronenergy.shelly", "/Pv/Disable", int(disabled))
+		if self._acsystem0:
+			self._dbusmonitor.set_value_async(self._acsystem0, "/Pv/Disable", int(disabled))
+
+		return True
+
+	@property
+	def pv_disabled(self) -> bool:
+		"""
+		Flag, if dess requests to disable PV. Defaults to False. Will timeout
+		after 20 reads.  DVCC will read continuously and timeout the value when
+		no longer set.
+		"""
+		return self._pv_disabled.get() or False
+
+	@pv_disabled.setter
+	def pv_disabled(self, v:bool):
+		self._pv_disabled.set(bool(v))
+
+	def device_added(self, service, instance, *args, **kwargs):
+		service_type = service.split('.')[2]
+		if service_type == 'acsystem' and self._dbusmonitor.get_value(service,
+				'/DeviceInstance') == 0:
+			self._acsystem0 = service
+
+	def device_removed(self, service, instance, *args, **kwargs):
+		if service == self._acsystem0:
+			self._acsystem0 = None
+
+	def update_values(self, newvalues):
+		if self._dbusservice["/Pv/Disable"] == 1 and self._pv_disabled.expired:
+			# Also restore operation for hub4 and multi rs
+			self._dbusmonitor.set_value_async("com.victronenergy.hub4", "/Pv/Disable", 0)
+			self._dbusmonitor.set_value_async("com.victronenergy.shelly", "/Pv/Disable", 0)
+			if self._acsystem0 is not None:
+				self._dbusmonitor.set_value_async(self._acsystem0, "/Pv/Disable", 0)
+			self._dbusservice["/Pv/Disable"] = 0
