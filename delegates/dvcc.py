@@ -734,8 +734,17 @@ class ChargerSubsystem(object):
 		# are running flat out, and can be handled separately.
 
 		capacity = sum(c.currentlimit for c in chargers)
-		limit = sum(c.maxchargecurrent for c in chargers)
-		actual = min(sum(c.smoothed_current for c in chargers), limit)
+
+		# The charge current a charger contributes to the battery cannot
+		# exceed its own capacity. For inverter/chargers the smoothed current
+		# is derived from PV yield (/Yield/Power), which also feeds AC loads
+		# or the grid and can therefore read higher than the charger's DC
+		# current limit. Clamp it per charger so the interpolation below stays
+		# well-defined (a <= c) and the individual currents remain consistent
+		# with their total (otherwise the distributive law used to compute the
+		# limits breaks and hands out limits that exceed max_charge_current).
+		currents = [min(c.smoothed_current, c.currentlimit) for c in chargers]
+		actual = sum(currents)
 
 		try:
 			P = (max_charge_current - actual) / max(capacity - actual, 0.0)
@@ -761,8 +770,8 @@ class ChargerSubsystem(object):
 		else:
 			assigned = 0.0
 			spillover = 0.0
-			for charger in chargers:
-				l = max((a := charger.smoothed_current) + P * (
+			for charger, a in zip(chargers, currents):
+				l = max(a + P * (
 					charger.currentlimit - a) + spillover, 0.0)
 
 				# The vreg is only capable of the nearest 100mA, so round

@@ -466,6 +466,36 @@ class TestHubSystem(TestSystemCalcBase):
 		self.assertAlmostEqual(
 			sum(c.maxchargecurrent for c in (c1, c2, c3)), 2.8, places=1)
 
+	def test_charge_current_distribution_yield_exceeds_limit(self):
+		# Inverter/chargers derive their smoothed current from PV yield
+		# (/Yield/Power), which also feeds AC loads or the grid and can
+		# therefore read higher than the charger's assigned limit. This
+		# must not blow up the distribution and hand out limits that far
+		# exceed the requested maximum.
+		from delegates.dvcc import ChargerSubsystem
+
+		chargers = [
+			# 100A capacity, currently limited to 20A, but PV yield reads
+			# 80A because the solar is feeding AC loads directly.
+			c1 := Charger(100, 20, 80),
+			c2 := Charger(100, 20, 80),
+			c3 := Charger(100, 20, 80)
+		]
+
+		for _ in range(3):
+			ChargerSubsystem._distribute_current(chargers, 30)
+
+		# No charger may be assigned more than the requested maximum
+		for c in (c1, c2, c3):
+			self.assertLessEqual(c.maxchargecurrent, 30)
+
+		# The load is shared evenly and adds up to the requested maximum
+		self.assertAlmostEqual(c1.maxchargecurrent, 10.0)
+		self.assertAlmostEqual(c2.maxchargecurrent, 10.0)
+		self.assertAlmostEqual(c3.maxchargecurrent, 10.0)
+		self.assertAlmostEqual(
+			sum(c.maxchargecurrent for c in (c1, c2, c3)), 30.0, places=1)
+
 	def test_control_vedirect_solarcharger_bms_ess_feedback(self):
 		# When feedback is allowed we do not limit MPPTs
 		# Force system type to ESS
