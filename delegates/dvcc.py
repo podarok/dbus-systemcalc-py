@@ -746,6 +746,27 @@ class ChargerSubsystem(object):
 		currents = [min(c.smoothed_current, c.currentlimit) for c in chargers]
 		actual = sum(currents)
 
+		if max_charge_current < actual:
+			# We need less than the chargers are currently producing. The
+			# interpolation below (between production and capacity) would
+			# extrapolate the limit of a charger with a lot of headroom
+			# below zero; clamping that to zero silently drops the reduction
+			# and makes the remaining limits add up to more than requested.
+			# Instead scale each charger's production down proportionally,
+			# which keeps every limit in [0, actual] and sums to the target.
+			assigned = 0.0
+			spillover = 0.0
+			for charger, a in zip(chargers, currents):
+				l = max(a * (max_charge_current / actual) + spillover, 0.0)
+
+				# The vreg is only capable of the nearest 100mA, so round
+				# it, and keep the remainder for the next iteration,
+				# so the max error is 100mA at the last charger.
+				spillover = l - (r := round(l, 1))
+				charger.maxchargecurrent = r
+				assigned += r
+			return min(max_charge_current, assigned)
+
 		try:
 			P = (max_charge_current - actual) / max(capacity - actual, 0.0)
 		except ZeroDivisionError:
